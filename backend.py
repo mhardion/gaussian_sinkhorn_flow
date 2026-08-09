@@ -50,7 +50,7 @@ def BS(eps, sig0, sig1):
     return (.5*(D_0 + D_1) - D_cross).sum() + .5*eps*torch.log(D_cross+.5*eps).sum() - .25*eps*torch.log(D_0+.5*eps).sum() - .25*eps*torch.log(D_1+.5*eps).sum()
 
 
-def plot_gaussian_flow(ax, covariances, covariance_target=None, means=None, mean_target=None, subsample=1, cmap = plt.cm.get_cmap('viridis'), kw={}, kw_target={}):
+def plot_gaussian_flow(ax, covariances, covariance_target=None, means=None, mean_target=None, subsample=1, cmap = plt.get_cmap('viridis'), kw={}, kw_target={}):
     covs = covariances[::subsample]
     N = covs.shape[0]
     t = np.linspace(0, 1, N)
