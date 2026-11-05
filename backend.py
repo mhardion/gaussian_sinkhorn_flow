@@ -183,7 +183,6 @@ def sinkhorn_loop(µ1, µ2, c_xy, c_yx, eps_list, init=None, tol=1e-4):
         f12, g12 = 0.5 * (f12 + f12_), 0.5 * (g12 + g12_) 
 
     torch.autograd.set_grad_enabled(True)
-    # print(count, end='\r')
     f12, g12 = (
         softmin(eps, c_xy, (log_µ2 + g12 / eps).detach()),
         softmin(eps, c_yx, (log_µ1 + f12 / eps).detach()),
@@ -228,7 +227,6 @@ def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
         params_storage.append(copy.deepcopy(model.state_dict()))
 
     for i, tau in enumerate(t.diff()):
-        # Train on several Euler steps along the induced flow.
         model_frozen = copy.deepcopy(model).eval()
         model_frozen.requires_grad_(False)
         for _ in range(inner_steps):
@@ -253,7 +251,6 @@ def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
             loss.backward()
             optimizer.step()
 
-        # "Full" loss
         with torch.no_grad():
             l = []
             for _ in range(average_Seps_over):
@@ -262,13 +259,7 @@ def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
             l = np.array(l)
             losses.append(l.mean())
             stdivs.append(np.std(l))
-        # Subsample loss
-        # c_xy = .5*euclidean_cost(x, y)
-        # c_xx = .5*euclidean_cost(x, x)
-        # f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_steps, tol=tol, init=(f_cross, g_cross))
-        # f_self = self_transport(µ, c_xx, eps,  tol=tol, max_steps=max_steps, init=f_self)
-        # g_self = self_transport(µ, .5*euclidean_cost(y, y), eps, tol=tol, max_steps=max_steps)
-        # losses.append((f_cross - f_self + g_cross - g_self).mean().item())    
+
         if params_storage is not None:
             params_storage.append(copy.deepcopy(model.state_dict()))
         print(f'{i+1}/{len(t)-1}', end='\r')
