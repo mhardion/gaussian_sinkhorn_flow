@@ -3,8 +3,18 @@ import numpy as np
 from matplotlib.patches import Ellipse
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from geomloss import SamplesLoss
+from typing import Callable
 
+import copy
 
+def sqnorm(x: torch.Tensor):
+    return (x*x).sum(dim=-1)
+
+def euclidean_cost(x, y):
+    normx = sqnorm(x)
+    normy = sqnorm(y)
+    return normx[:,None] + normy[None,:] - 2*x@y.T
 
 def matrix_sqrt(mat: torch.Tensor) -> torch.Tensor:
     eigvals, eigvecs = torch.linalg.eig(mat)
@@ -147,3 +157,120 @@ def plot_cv_speed(ax, sigma_0_list, sigma_star_list, blur_list, t, labels, cmap=
     if showlegend:
         ax.legend(fontsize=15)
     return ax
+
+# Code was adapted from the geomloss package, see https://github.com/jeanfeydy/geomloss 
+def softmin(eps, c, f):
+    return -eps * (f.view(1, -1) - c / eps).logsumexp(1).view(-1)
+
+def sinkhorn_loop(µ1, µ2, c_xy, c_yx, eps_list, init=None, tol=1e-4):
+    log_µ1 = clampedlog(µ1)
+    log_µ2 = clampedlog(µ2)
+    torch.autograd.set_grad_enabled(False)
+    eps = eps_list[0]
+    if init is None:
+        f12 = softmin(eps, c_xy, log_µ2)
+        g12 = softmin(eps, c_yx, log_µ1)
+    else:
+        f12, g12 = init
+    # count = 0
+    for eps in eps_list:
+        f12_ = softmin(eps, c_xy, log_µ2 + g12 / eps)
+        g12_ = softmin(eps, c_yx, log_µ1 + f12 / eps)
+        # count+=1
+        if max(abs(f12_ - f12).max().item(),
+               abs(g12_ - g12).max().item()) < tol:
+            break
+        f12, g12 = 0.5 * (f12 + f12_), 0.5 * (g12 + g12_) 
+
+    torch.autograd.set_grad_enabled(True)
+    # print(count, end='\r')
+    f12, g12 = (
+        softmin(eps, c_xy, (log_µ2 + g12 / eps).detach()),
+        softmin(eps, c_yx, (log_µ1 + f12 / eps).detach()),
+    )
+    return f12, g12
+
+def clampedlog(a):
+    loga = torch.log(a)
+    loga[a <= 0] = -1e5
+    return loga
+
+def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
+                max_steps=150, tol=1e-3, sample_size=500, lr=1e-3, average_Seps_over=5, params_storage=None):
+    device = next(model.parameters()).device
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    eps = blur**2
+
+    if not callable(target):
+        assert target.size(0) >= sample_size
+        def target_sampler(N):
+            index = torch.randperm(target.size(0))[:N]
+            return target[index]
+    else:
+        target_sampler = target
+
+    µ = torch.ones(sample_size, device=device)/sample_size
+
+
+
+    Skdiv = SamplesLoss(blur=blur, backend='tensorized')
+
+    with torch.no_grad():
+        l = []
+        for _ in range(average_Seps_over):
+            l.append(Skdiv(target_sampler(sample_size),
+                           model(torch.randn(sample_size, model.input_dim, device=device))).item())
+        l = np.array(l)
+        losses = [l.mean()]
+        stdivs = [np.std(l)]
+
+    if params_storage is not None:
+        params_storage.append(copy.deepcopy(model.state_dict()))
+
+    for i, tau in enumerate(t.diff()):
+        # Train on several Euler steps along the induced flow.
+        model_frozen = copy.deepcopy(model).eval()
+        model_frozen.requires_grad_(False)
+        for _ in range(inner_steps):
+            e = torch.randn(sample_size, model.input_dim, device=device)
+            e_ = torch.randn(sample_size, model.input_dim, device=device)
+            x = model(e)
+            x_prev = model_frozen(e)
+            x_prev_ = model_frozen(e_)
+            y = target_sampler(sample_size)
+            with torch.no_grad():
+                c_xy = .5*euclidean_cost(x_prev, y)
+                c_xx = .5*euclidean_cost(x_prev, x_prev_)
+                f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_steps, tol=tol, init=(f_cross, g_cross) if i else None)
+                f_self, g_self = sinkhorn_loop(µ, µ, c_xx, c_xx.T, [eps]*max_steps, tol=tol, init=(f_self, g_self) if i else None)
+                K_self = torch.exp((f_self[:,None] + g_self[None, :] -c_xx)/eps)/sample_size
+                K_cross = torch.exp((f_cross[:,None] + g_cross[None,:]-c_xy)/eps)/sample_size
+                gradient = (K_self @ x_prev_ - K_cross @ y)
+                x_drifted = x_prev - tau*gradient
+            
+            loss = torch.mean((x - x_drifted) ** 2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # "Full" loss
+        with torch.no_grad():
+            l = []
+            for _ in range(average_Seps_over):
+                l.append(Skdiv(target_sampler(sample_size),
+                           model(torch.randn(sample_size, model.input_dim, device=device))).item())
+            l = np.array(l)
+            losses.append(l.mean())
+            stdivs.append(np.std(l))
+        # Subsample loss
+        # c_xy = .5*euclidean_cost(x, y)
+        # c_xx = .5*euclidean_cost(x, x)
+        # f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_steps, tol=tol, init=(f_cross, g_cross))
+        # f_self = self_transport(µ, c_xx, eps,  tol=tol, max_steps=max_steps, init=f_self)
+        # g_self = self_transport(µ, .5*euclidean_cost(y, y), eps, tol=tol, max_steps=max_steps)
+        # losses.append((f_cross - f_self + g_cross - g_self).mean().item())    
+        if params_storage is not None:
+            params_storage.append(copy.deepcopy(model.state_dict()))
+        print(f'{i+1}/{len(t)-1}', end='\r')
+
+    return np.array(losses), np.array(stdivs)
