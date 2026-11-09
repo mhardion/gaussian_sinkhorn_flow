@@ -16,6 +16,11 @@ def euclidean_cost(x, y):
     normy = sqnorm(y)
     return normx[:,None] + normy[None,:] - 2*x@y.T
 
+def euclidean_cost_batch(x, y):
+    normx = sqnorm(x)
+    normy = sqnorm(y)
+    return normx[:,:,None] + normy[:,None,:] - 2*torch.einsum('bik,bjk->bij', x, y)
+
 def matrix_sqrt(mat: torch.Tensor) -> torch.Tensor:
     eigvals, eigvecs = torch.linalg.eig(mat)
     assert not (eigvals.imag.any() or eigvecs.imag.any())
@@ -212,7 +217,7 @@ def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
 
 
 
-    Skdiv = SamplesLoss(blur=blur, backend='tensorized')
+    Skdiv = SamplesLoss(blur=blur, backend='tensorized', cost=euclidean_cost_batch)
 
     with torch.no_grad():
         l = []
@@ -237,13 +242,13 @@ def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
             x_prev_ = model_frozen(e_)
             y = target_sampler(sample_size)
             with torch.no_grad():
-                c_xy = .5*euclidean_cost(x_prev, y)
-                c_xx = .5*euclidean_cost(x_prev, x_prev_)
+                c_xy = euclidean_cost(x_prev, y)
+                c_xx = euclidean_cost(x_prev, x_prev_)
                 f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_steps, tol=tol, init=(f_cross, g_cross) if i else None)
                 f_self, g_self = sinkhorn_loop(µ, µ, c_xx, c_xx.T, [eps]*max_steps, tol=tol, init=(f_self, g_self) if i else None)
                 K_self = torch.exp((f_self[:,None] + g_self[None, :] -c_xx)/eps)/sample_size
                 K_cross = torch.exp((f_cross[:,None] + g_cross[None,:]-c_xy)/eps)/sample_size
-                gradient = (K_self @ x_prev_ - K_cross @ y)
+                gradient = 2*(K_self @ x_prev_ - K_cross @ y)
                 x_drifted = x_prev - tau*gradient
             
             loss = torch.mean((x - x_drifted) ** 2)
