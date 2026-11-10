@@ -3,9 +3,8 @@ import numpy as np
 from matplotlib.patches import Ellipse
 import matplotlib.pyplot as plt
 from scipy.stats import norm
-from geomloss import SamplesLoss
 from typing import Callable
-
+from torch import nn
 import copy
 
 def sqnorm(x: torch.Tensor):
@@ -199,74 +198,73 @@ def clampedlog(a):
     loga[a <= 0] = -1e5
     return loga
 
-def train_model(model, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
-                max_steps=150, tol=1e-3, sample_size=500, lr=1e-3, average_Seps_over=5, params_storage=None):
-    device = next(model.parameters()).device
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    eps = blur**2
+# Class for the neural network
+class MLP_drifting(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, activation=nn.Tanh):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, output_dim),
+        )
 
-    if not callable(target):
-        assert target.size(0) >= sample_size
-        def target_sampler(N):
-            index = torch.randperm(target.size(0))[:N]
-            return target[index]
-    else:
-        target_sampler = target
+    def forward(self, x):
+        return self.network(x)
 
-    µ = torch.ones(sample_size, device=device)/sample_size
+    def train_drifting(self, target:Callable|torch.Tensor, t, blur=1, inner_steps=30,
+                    max_sinkhorn_steps=150, sinkhorn_tol=1e-3, sample_size=500, lr=1e-3, return_params_t=True):
+        device = next(self.parameters()).device
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        eps = blur**2
 
+        if not callable(target):
+            assert target.size(0) >= sample_size
+            def target_sampler(N):
+                index = torch.randperm(target.size(0))[:N]
+                return target[index]
+        else:
+            target_sampler = target
 
+        µ = torch.ones(sample_size, device=device)/sample_size
 
-    Skdiv = SamplesLoss(blur=blur, backend='tensorized', cost=euclidean_cost_batch)
+        if return_params_t:
+            params_t = [copy.deepcopy(self.state_dict())]
 
-    with torch.no_grad():
-        l = []
-        for _ in range(average_Seps_over):
-            l.append(Skdiv(target_sampler(sample_size),
-                           model(torch.randn(sample_size, model.input_dim, device=device))).item())
-        l = np.array(l)
-        losses = [l.mean()]
-        stdivs = [np.std(l)]
+        for i, tau in enumerate(t.diff()):
+            model_frozen = copy.deepcopy(self).eval()
+            model_frozen.requires_grad_(False)
+            for _ in range(inner_steps):
+                e = torch.randn(sample_size, self.input_dim, device=device)
+                e_ = torch.randn(sample_size, self.input_dim, device=device)
+                x = self(e)
+                x_prev = model_frozen(e)
+                x_prev_ = model_frozen(e_)
+                y = target_sampler(sample_size)
+                with torch.no_grad():
+                    c_xy = euclidean_cost(x_prev, y)
+                    c_xx = euclidean_cost(x_prev, x_prev_)
+                    f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_sinkhorn_steps, tol=sinkhorn_tol, init=(f_cross, g_cross) if i else None)
+                    f_self, g_self = sinkhorn_loop(µ, µ, c_xx, c_xx.T, [eps]*max_sinkhorn_steps, tol=sinkhorn_tol, init=(f_self, g_self) if i else None)
+                    K_self = torch.exp((f_self[:,None] + g_self[None, :] -c_xx)/eps)/sample_size
+                    K_cross = torch.exp((f_cross[:,None] + g_cross[None,:]-c_xy)/eps)/sample_size
+                    gradient = 2*(K_self @ x_prev_ - K_cross @ y)
+                    x_drifted = x_prev - tau*gradient
+                
+                loss = torch.mean((x - x_drifted) ** 2)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            if return_params_t:
+                params_t.append(copy.deepcopy(self.state_dict()))
+            print(f'{i+1}/{len(t)-1}', end='\r')
 
-    if params_storage is not None:
-        params_storage.append(copy.deepcopy(model.state_dict()))
-
-    for i, tau in enumerate(t.diff()):
-        model_frozen = copy.deepcopy(model).eval()
-        model_frozen.requires_grad_(False)
-        for _ in range(inner_steps):
-            e = torch.randn(sample_size, model.input_dim, device=device)
-            e_ = torch.randn(sample_size, model.input_dim, device=device)
-            x = model(e)
-            x_prev = model_frozen(e)
-            x_prev_ = model_frozen(e_)
-            y = target_sampler(sample_size)
-            with torch.no_grad():
-                c_xy = euclidean_cost(x_prev, y)
-                c_xx = euclidean_cost(x_prev, x_prev_)
-                f_cross, g_cross = sinkhorn_loop(µ, µ, c_xy, c_xy.T, [eps]*max_steps, tol=tol, init=(f_cross, g_cross) if i else None)
-                f_self, g_self = sinkhorn_loop(µ, µ, c_xx, c_xx.T, [eps]*max_steps, tol=tol, init=(f_self, g_self) if i else None)
-                K_self = torch.exp((f_self[:,None] + g_self[None, :] -c_xx)/eps)/sample_size
-                K_cross = torch.exp((f_cross[:,None] + g_cross[None,:]-c_xy)/eps)/sample_size
-                gradient = 2*(K_self @ x_prev_ - K_cross @ y)
-                x_drifted = x_prev - tau*gradient
-            
-            loss = torch.mean((x - x_drifted) ** 2)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        with torch.no_grad():
-            l = []
-            for _ in range(average_Seps_over):
-                l.append(Skdiv(target_sampler(sample_size),
-                           model(torch.randn(sample_size, model.input_dim, device=device))).item())
-            l = np.array(l)
-            losses.append(l.mean())
-            stdivs.append(np.std(l))
-
-        if params_storage is not None:
-            params_storage.append(copy.deepcopy(model.state_dict()))
-        print(f'{i+1}/{len(t)-1}', end='\r')
-
-    return np.array(losses), np.array(stdivs)
+        if return_params_t:
+            return params_t
+    
+    def sample(self, n):
+        return self(torch.randn(n, self.input_dim, device=next(self.parameters()).device))
