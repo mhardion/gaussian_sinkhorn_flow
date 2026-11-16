@@ -2,4 +2,4 @@ Numerical illustrations for the article "The Wasserstein gradient flow of the Si
 
 Requirements: working versions of ```pytorch```, ```numpy```, ```matplotlib```, ```geomloss```, ```sklearn``` and ```scipy```.
 
-The folders storing the models for each size are called ```models_[input_dim]_[hidden_dim]_[output_dim].zip```.
+The folders storing the models for each size are called ```models_[input_dim]_[hidden_dim_1]_[hidden_dim_2[output_dim].zip```. The figures are named similarly with the sizes of the two compared models.
